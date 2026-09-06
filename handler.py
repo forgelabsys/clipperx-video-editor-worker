@@ -4,11 +4,16 @@ import subprocess
 import re
 import os
 import tempfile
+import urllib.request
 
 
 def decode_to_file(b64_data, path):
     with open(path, "wb") as f:
         f.write(base64.b64decode(b64_data))
+
+
+def download_to_file(url, path):
+    urllib.request.urlretrieve(url, path)
 
 
 def run(cmd):
@@ -102,7 +107,14 @@ def handler(event):
 
     audio_format = inp.get("audio_format", "mp3")
     audio_path = os.path.join(workdir, f"audio_in.{audio_format}")
-    decode_to_file(inp["audio_base64"], audio_path)
+    # `audio_url` (o worker baixa ele mesmo) tem prioridade sobre
+    # `audio_base64` — usado pela produção automática de vídeo pra evitar
+    # embutir a narração inteira (vários MB) no corpo do job, que tem
+    # limite de 10MiB no RunPod. Uploads feitos via URL pré-assinada do R2.
+    if "audio_url" in inp:
+        download_to_file(inp["audio_url"], audio_path)
+    else:
+        decode_to_file(inp["audio_base64"], audio_path)
 
     threshold_db = inp.get("silence_threshold_db", -40)
     min_silence = inp.get("min_silence_duration", 0.4)
@@ -122,15 +134,26 @@ def handler(event):
 
     new_total_duration = get_duration(trimmed_audio_path)
 
-    images = inp["images"]  # list of base64 PNG/JPEG strings, in order
+    # Mesma prioridade: `image_urls` (baixadas pelo worker) sobre `images`
+    # (base64 embutido) — mesmo motivo do áudio, só que ainda mais crítico
+    # aqui porque um vídeo real tem dezenas/centenas de imagens.
+    if "image_urls" in inp:
+        image_sources = inp["image_urls"]
+        sources_are_urls = True
+    else:
+        image_sources = inp["images"]
+        sources_are_urls = False
     segments = inp["segments"]  # list of {"start": float} in original-audio seconds
-    if len(images) != len(segments):
-        return {"error": f"images ({len(images)}) and segments ({len(segments)}) length mismatch"}
+    if len(image_sources) != len(segments):
+        return {"error": f"images ({len(image_sources)}) and segments ({len(segments)}) length mismatch"}
 
     image_paths = []
-    for i, img_b64 in enumerate(images):
+    for i, src in enumerate(image_sources):
         p = os.path.join(workdir, f"img_{i:04d}.png")
-        decode_to_file(img_b64, p)
+        if sources_are_urls:
+            download_to_file(src, p)
+        else:
+            decode_to_file(src, p)
         image_paths.append(p)
 
     new_starts = [remap_time(seg["start"], silences) for seg in segments]
