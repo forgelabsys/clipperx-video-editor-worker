@@ -25,12 +25,30 @@ No GPU needed — pure ffmpeg/CPU work.
 | `width` / `height` | int | `1920` / `1080` | Output video resolution |
 | `crf` | int | `16` | x264 quality (lower = better/bigger) |
 | `fps` | int | `24` | Output frame rate |
+| `output_upload_url` | str | none | Presigned PUT URL (e.g. R2/S3) the worker uploads the final MP4 to itself, instead of returning it as `video_base64` |
 
 ## Output
+
+Without `output_upload_url` (small clips only):
 
 ```json
 {
   "video_base64": "...",
+  "original_duration": 470.86,
+  "new_duration": 402.11,
+  "time_saved": 68.75,
+  "silences_cut": 132
+}
+```
+
+With `output_upload_url` — same fields minus `video_base64` (the video was PUT
+to that URL instead). This exists because RunPod also caps job *results*
+around the same ~10MiB the input payload is capped at: a real multi-minute
+video, base64-encoded (+33% overhead), blows past that easily — the job then
+comes back `COMPLETED` with no `output` field at all, silently dropped:
+
+```json
+{
   "original_duration": 470.86,
   "new_duration": 402.11,
   "time_saved": 68.75,

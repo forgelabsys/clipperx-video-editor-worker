@@ -16,6 +16,16 @@ def download_to_file(url, path):
     urllib.request.urlretrieve(url, path)
 
 
+def upload_via_put(url, path):
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(url, data=data, method="PUT")
+    req.add_header("Content-Type", "video/mp4")
+    with urllib.request.urlopen(req) as resp:
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"output upload failed: HTTP {resp.status}")
+
+
 def run(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
@@ -189,16 +199,26 @@ def handler(event):
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         return {"error": "ffmpeg failed to produce output", "stderr": result.stderr[-4000:]}
 
-    with open(output_path, "rb") as f:
-        video_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    return {
-        "video_base64": video_b64,
+    stats = {
         "original_duration": total_duration,
         "new_duration": new_total_duration,
         "time_saved": round(total_duration - new_total_duration, 3),
         "silences_cut": len(silences),
     }
+
+    # `output_upload_url` (PUT pré-assinada do R2) tem prioridade sobre
+    # devolver o vídeo em base64 no corpo da resposta — testado na prática,
+    # um vídeo real (MP4 + ~33% do base64) estoura o limite de payload de
+    # RESULTADO do RunPod, e o job volta "COMPLETED" mas sem o campo
+    # `output` nenhum (descartado silenciosamente). Mesmo motivo que já nos
+    # fez usar URL em vez de base64 do lado da entrada (áudio/imagens).
+    if "output_upload_url" in inp:
+        upload_via_put(inp["output_upload_url"], output_path)
+        return stats
+
+    with open(output_path, "rb") as f:
+        video_b64 = base64.b64encode(f.read()).decode("utf-8")
+    return {"video_base64": video_b64, **stats}
 
 
 if __name__ == "__main__":
