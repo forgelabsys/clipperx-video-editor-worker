@@ -3,8 +3,10 @@ import base64
 import subprocess
 import re
 import os
+import io
 import tempfile
 import urllib.request
+from PIL import Image
 
 
 def decode_to_file(b64_data, path):
@@ -14,6 +16,20 @@ def decode_to_file(b64_data, path):
 
 def download_to_file(url, path):
     urllib.request.urlretrieve(url, path)
+
+
+def load_image(src):
+    """Accepts a data: URI, an http(s) URL, or raw base64 (no prefix) — the
+    three forms used across this app (ver toRawBase64 no lado da app)."""
+    if src.startswith("data:"):
+        b64 = src.split(",", 1)[1]
+        data = base64.b64decode(b64)
+    elif src.startswith("http://") or src.startswith("https://"):
+        with urllib.request.urlopen(src) as resp:
+            data = resp.read()
+    else:
+        data = base64.b64decode(src)
+    return Image.open(io.BytesIO(data)).convert("RGBA")
 
 
 def upload_via_put(url, path):
@@ -111,8 +127,82 @@ def trim_silences(audio_path, keep_segments, out_path, workdir):
     return out_path
 
 
-def handler(event):
-    inp = event["input"]
+# ─── Composição 2D (Pillow) ──────────────────────────────────────────────
+# Sobrepõe um sprite de personagem (PNG com fundo transparente) num cenário
+# de fundo 16:9 gerado por IA — passo intermediário ANTES da timeline de
+# vídeo (handle_edit_video abaixo), pra travar a composição de cada cena
+# (posição/escala/espelhamento do personagem) antes de virar frame de vídeo.
+ANCHOR_POSITIONS = {
+    "top_left": lambda bw, bh, sw, sh: (0, 0),
+    "top_center": lambda bw, bh, sw, sh: ((bw - sw) // 2, 0),
+    "top_right": lambda bw, bh, sw, sh: (bw - sw, 0),
+    "center_left": lambda bw, bh, sw, sh: (0, (bh - sh) // 2),
+    "center": lambda bw, bh, sw, sh: ((bw - sw) // 2, (bh - sh) // 2),
+    "center_right": lambda bw, bh, sw, sh: (bw - sw, (bh - sh) // 2),
+    "bottom_left": lambda bw, bh, sw, sh: (0, bh - sh),
+    "bottom_center": lambda bw, bh, sw, sh: ((bw - sw) // 2, bh - sh),
+    "bottom_right": lambda bw, bh, sw, sh: (bw - sw, bh - sh),
+}
+
+
+def handle_composite(inp):
+    background = load_image(inp["background_image"])
+    sprite = load_image(inp["character_sprite"])
+
+    bg_w, bg_h = background.size
+    sprite_w, sprite_h = sprite.size
+
+    # Escala — mantém a proporção original do sprite, só muda o tamanho.
+    scale = inp.get("scale") or {}
+    mode = scale.get("mode", "height_percentage")
+    value = scale.get("value", 1.0)
+    if mode == "height_percentage":
+        target_h = bg_h * value
+        target_w = sprite_w * (target_h / sprite_h)
+    elif mode == "width_percentage":
+        target_w = bg_w * value
+        target_h = sprite_h * (target_w / sprite_w)
+    elif mode == "absolute":
+        target_w = scale.get("width", sprite_w)
+        target_h = scale.get("height", sprite_h)
+    else:
+        return {"error": f"unknown scale.mode: {mode!r}"}
+    target_w = max(1, round(target_w))
+    target_h = max(1, round(target_h))
+    if (target_w, target_h) != (sprite_w, sprite_h):
+        sprite = sprite.resize((target_w, target_h), Image.LANCZOS)
+    sprite_w, sprite_h = sprite.size
+
+    if inp.get("flip_horizontal"):
+        sprite = sprite.transpose(Image.FLIP_LEFT_RIGHT)
+
+    # Posição — âncora (um dos 9 pontos do cenário) + offset em pixels.
+    position = inp.get("position") or {}
+    anchor = position.get("anchor", "bottom_left")
+    if anchor not in ANCHOR_POSITIONS:
+        return {"error": f"unknown position.anchor: {anchor!r}"}
+    base_x, base_y = ANCHOR_POSITIONS[anchor](bg_w, bg_h, sprite_w, sprite_h)
+    x = round(base_x + position.get("offset_x", 0))
+    y = round(base_y + position.get("offset_y", 0))
+
+    composed = background.copy()
+    composed.alpha_composite(sprite, (x, y))
+
+    buf = io.BytesIO()
+    # RGB (não RGBA) — essa imagem já tem o fundo embutido, é o frame final
+    # pronto pra virar vídeo (handle_edit_video), não precisa mais de canal
+    # alfa.
+    composed.convert("RGB").save(buf, format="PNG")
+    composed_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    return {
+        "composed_image_base64": composed_b64,
+        "width": composed.width,
+        "height": composed.height,
+    }
+
+
+def handle_edit_video(inp):
     workdir = tempfile.mkdtemp()
 
     audio_format = inp.get("audio_format", "mp3")
@@ -219,6 +309,16 @@ def handler(event):
     with open(output_path, "rb") as f:
         video_b64 = base64.b64encode(f.read()).decode("utf-8")
     return {"video_base64": video_b64, **stats}
+
+
+# Um worker/endpoint só, dois modos — roteado pelos campos presentes no
+# input, não por um "action" explícito (mantém compatibilidade com quem já
+# chama esse endpoint pra editar vídeo sem precisar mandar um campo novo).
+def handler(event):
+    inp = event["input"]
+    if "background_image" in inp and "character_sprite" in inp:
+        return handle_composite(inp)
+    return handle_edit_video(inp)
 
 
 if __name__ == "__main__":
