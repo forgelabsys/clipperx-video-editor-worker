@@ -68,6 +68,30 @@ def detect_silences(audio_path, threshold_db=-40, min_duration=0.4):
     return list(zip(starts[:n], ends[:n]))
 
 
+# Um "keep" (trecho de áudio real, não-silêncio) mais curto que isso não
+# rende nem um frame de AAC (~42ms num áudio de 24kHz) — a extração via
+# ffmpeg (-ss/-to) sai vazia e derruba o job inteiro ("segment N extraction
+# failed"). Visto na prática com narração TTS de silêncio digital exato
+# (Kokoro): o limiar de silêncio às vezes detecta dois silêncios quase
+# colados, com uma fresta de poucos ms de "áudio" entre eles que na
+# verdade não é conteúdo aproveitável. Funde os dois silêncios em vez de
+# tentar extrair essa fresta.
+MIN_KEEP_GAP = 0.1
+
+
+def merge_close_silences(silences, min_gap=MIN_KEEP_GAP):
+    if not silences:
+        return silences
+    merged = [silences[0]]
+    for s, e in silences[1:]:
+        last_s, last_e = merged[-1]
+        if s - last_e < min_gap:
+            merged[-1] = (last_s, max(last_e, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 def build_keep_segments(total_duration, silences):
     """Inverse of the silences: the audio spans we actually keep."""
     keep = []
@@ -108,6 +132,13 @@ def trim_silences(audio_path, keep_segments, out_path, workdir):
     concat_list_path = os.path.join(workdir, "audio_concat.txt")
     lines = []
     for i, (s, e) in enumerate(keep_segments):
+        # Rede de segurança além do merge_close_silences (que já deveria
+        # evitar isso): um keep degenerado (ex.: colado no fim do áudio)
+        # não rende frame de AAC nenhum — pular alguns ms é imperceptível,
+        # travar o job de vídeo inteiro (dezenas de minutos de render) por
+        # causa disso não vale a pena.
+        if e - s < MIN_KEEP_GAP:
+            continue
         seg_path = os.path.join(segment_dir, f"seg_{i:04d}.aac")
         cmd = (
             f'ffmpeg -i "{audio_path}" -ss {s} -to {e} '
@@ -117,6 +148,9 @@ def trim_silences(audio_path, keep_segments, out_path, workdir):
         if not os.path.exists(seg_path) or os.path.getsize(seg_path) == 0:
             raise RuntimeError(f"segment {i} extraction failed: {result.stderr[-2000:]}")
         lines.append(f"file '{seg_path}'")
+
+    if not lines:
+        raise RuntimeError("trim_silences: nenhum segmento de áudio sobrou depois do corte.")
     with open(concat_list_path, "w") as f:
         f.write("\n".join(lines))
 
@@ -223,7 +257,7 @@ def handle_edit_video(inp):
     total_duration = get_duration(audio_path)
 
     if cut_silences:
-        silences = detect_silences(audio_path, threshold_db, min_silence)
+        silences = merge_close_silences(detect_silences(audio_path, threshold_db, min_silence))
         keep_segments = build_keep_segments(total_duration, silences)
         trimmed_audio_path = trim_silences(
             audio_path, keep_segments, os.path.join(workdir, "audio_trimmed.aac"), workdir
